@@ -78,6 +78,10 @@ function createContext(directory) {
 }
 
 // ---------------------------------------------------------------------------
+function out(result) {
+  return typeof result === "object" && result !== null && result.output != null ? result.output : result;
+}
+
 // Shared state — single plugin instance reused across all tests
 // ---------------------------------------------------------------------------
 
@@ -104,7 +108,8 @@ before(async () => {
   while (Date.now() < deadline) {
     try {
       const probe = await grepExecute({ pattern: "import" }, ctx);
-      if (probe.length > 0) break;
+      const probeOutput = typeof probe === "string" ? probe : (probe && probe.output) || "";
+      if (probeOutput.length > 0) break;
     } catch { /* scan not ready yet */ }
     await new Promise((r) => setTimeout(r, 500));
   }
@@ -204,7 +209,7 @@ describe("FffPlugin", () => {
     it("grep args match OpenCode built-in parameter names", async () => {
       const { client } = createMockClient();
       const { tool } = await FffPlugin({ directory: tmpDir, client });
-      const openCodeParams = ["pattern", "path", "exclude", "caseSensitive", "context", "limit"];
+      const openCodeParams = ["pattern", "path", "include", "exclude", "caseSensitive", "context", "limit"];
       const pluginParams = Object.keys(tool.grep.args);
       for (const p of openCodeParams) {
         assert.ok(pluginParams.includes(p), `grep missing OpenCode param '${p}'`);
@@ -223,12 +228,12 @@ describe("FffPlugin", () => {
 
     it("grep execute returns Promise<string> (ToolResult contract)", async () => {
       const result = await grepExecute({ pattern: "foo" }, ctx);
-      assert.equal(typeof result, "string", "ToolResult must be string, not object");
+      assert.equal(typeof result, "object", "ToolResult must be object, not string");
     });
 
     it("glob execute returns Promise<string> (ToolResult contract)", async () => {
       const result = await globExecute({ pattern: "foo" }, ctx);
-      assert.equal(typeof result, "string", "ToolResult must be string, not object");
+      assert.equal(typeof result, "object", "ToolResult must be object, not string");
     });
   });
 
@@ -238,25 +243,25 @@ describe("FffPlugin", () => {
   describe("grep basic", () => {
     it("should find a simple text pattern", async () => {
       const result = await grepExecute({ pattern: "console.log" }, ctx);
-      assert.ok(result.includes("console.log"), `Expected 'console.log' in: ${result}`);
+      assert.ok(out(result).includes("console.log"), `Expected 'console.log' in: ${result}`);
     });
 
     it("should return 'file:line:content' format", async () => {
       const result = await grepExecute({ pattern: "console.log" }, ctx);
-      assert.ok(result.length > 0);
-      for (const line of result.split("\n").filter(Boolean)) {
+      assert.ok(out(result).length > 0);
+      for (const line of out(result).split("\n").filter(Boolean)) {
         assert.ok(/^.+:\d+:.+$/m.test(line), `Bad format: "${line}"`);
       }
     });
 
     it("should return empty string for no matches", async () => {
       const result = await grepExecute({ pattern: "ZZZNONEXISTENT_PATTERN_ZZZ" }, ctx);
-      assert.equal(result, "");
+      assert.ok(!out(result) || out(result) === "No files found", "Expected empty/found output");
     });
 
     it("should use relative paths (not absolute)", async () => {
       const result = await grepExecute({ pattern: "foo" }, ctx);
-      for (const line of result.split("\n").filter(Boolean)) {
+      for (const line of out(result).split("\n").filter(Boolean)) {
         const filePath = line.split(":")[0];
         assert.ok(!filePath.startsWith("/"), `Path should be relative: ${filePath}`);
       }
@@ -281,7 +286,7 @@ describe("FffPlugin", () => {
   describe("grep case sensitivity", () => {
     it("smart case (default): lowercase 'abc' matches both 'abc' and 'ABC'", async () => {
       const result = await grepExecute({ pattern: "abc" }, ctx);
-      const caseJsLines = result.split("\n").filter((l) => l.includes("case.js"));
+      const caseJsLines = out(result).split("\n").filter((l) => l.includes("case.js"));
       // case.js has: const lower = "abc";  const UPPER = "ABC";  const Mixed = "AbC";
       // With smartCase (default), lowercase 'abc' should match both lines
       assert.ok(caseJsLines.length >= 2, `Smart case 'abc' should match both 'abc' and 'ABC', got ${caseJsLines.length} lines in case.js`);
@@ -289,7 +294,7 @@ describe("FffPlugin", () => {
 
     it("smart case: uppercase 'ABC' triggers case-sensitive matching", async () => {
       const result = await grepExecute({ pattern: "ABC" }, ctx);
-      const caseJsLines = result.split("\n").filter((l) => l.includes("case.js"));
+      const caseJsLines = out(result).split("\n").filter((l) => l.includes("case.js"));
       // Smart case: uppercase pattern → case-sensitive, so 'ABC' only matches "ABC" not "abc"
       for (const line of caseJsLines) {
         const content = line.split(":").slice(2).join(":");
@@ -305,7 +310,7 @@ describe("FffPlugin", () => {
 
     it("caseSensitive=true: 'abc' only matches lowercase 'abc'", async () => {
       const result = await grepExecute({ pattern: "abc", caseSensitive: true }, ctx);
-      const caseJsLines = result.split("\n").filter((l) => l.includes("case.js"));
+      const caseJsLines = out(result).split("\n").filter((l) => l.includes("case.js"));
       for (const line of caseJsLines) {
         const content = line.split(":").slice(2).join(":");
         assert.ok(content.includes("abc"), `caseSensitive 'abc' should match 'abc': ${content}`);
@@ -316,13 +321,13 @@ describe("FffPlugin", () => {
       const resultDefault = await grepExecute({ pattern: "abc" }, ctx);
       const resultExplicit = await grepExecute({ pattern: "abc", caseSensitive: false }, ctx);
       // Both should return the same results
-      assert.equal(resultDefault, resultExplicit);
+      assert.equal(resultDefault.metadata.matches, resultExplicit.metadata.matches);
     });
 
     it("mixed-case 'AbC' triggers case-sensitive via smart case", async () => {
       const result = await grepExecute({ pattern: "AbC" }, ctx);
-      if (result.length > 0) {
-        for (const line of result.split("\n").filter(Boolean)) {
+      if (out(result).length > 0) {
+        for (const line of out(result).split("\n").filter(Boolean)) {
           const content = line.split(":").slice(2).join(":");
           assert.ok(content.includes("AbC"), `Smart case 'AbC' should be case-sensitive: ${content}`);
         }
@@ -336,7 +341,7 @@ describe("FffPlugin", () => {
   describe("grep path filtering", () => {
     it("should scope results to a subdirectory", async () => {
       const result = await grepExecute({ pattern: "export", path: "src" }, ctx);
-      for (const line of result.split("\n").filter(Boolean)) {
+      for (const line of out(result).split("\n").filter(Boolean)) {
         const filePath = line.split(":")[0];
         assert.ok(filePath === "src" || filePath.startsWith("src/"), `Path filter failed: ${filePath}`);
       }
@@ -345,12 +350,12 @@ describe("FffPlugin", () => {
     it("should normalize trailing slashes", async () => {
       const a = await grepExecute({ pattern: "export", path: "src/" }, ctx);
       const b = await grepExecute({ pattern: "export", path: "src" }, ctx);
-      assert.equal(a, b, "Trailing slash should be normalized");
+      assert.equal(out(a), out(b), "Trailing slash should be normalized");
     });
 
     it("should normalize multiple trailing slashes", async () => {
       const result = await grepExecute({ pattern: "export", path: "src///" }, ctx);
-      for (const line of result.split("\n").filter(Boolean)) {
+      for (const line of out(result).split("\n").filter(Boolean)) {
         const filePath = line.split(":")[0];
         assert.ok(filePath.startsWith("src/"), `Multi-slash path filter failed: ${filePath}`);
       }
@@ -358,12 +363,12 @@ describe("FffPlugin", () => {
 
     it("should return empty for nonexistent path", async () => {
       const result = await grepExecute({ pattern: "export", path: "nonexistent_dir" }, ctx);
-      assert.equal(result, "");
+      assert.ok(!out(result) || out(result) === "No files found", "Expected empty/found output");
     });
 
     it("should filter to nested subdirectory", async () => {
       const result = await grepExecute({ pattern: ".", path: "src/components" }, ctx);
-      for (const line of result.split("\n").filter(Boolean)) {
+      for (const line of out(result).split("\n").filter(Boolean)) {
         const filePath = line.split(":")[0];
         assert.ok(
           filePath.startsWith("src/components/"),
@@ -380,15 +385,15 @@ describe("FffPlugin", () => {
     it("should exclude files matching a single glob", async () => {
       const all = await grepExecute({ pattern: "export" }, ctx);
       const filtered = await grepExecute({ pattern: "export", exclude: "src/**" }, ctx);
-      assert.ok(filtered.split("\n").filter(Boolean).length <= all.split("\n").filter(Boolean).length);
-      for (const line of filtered.split("\n").filter(Boolean)) {
+      assert.ok(out(filtered).split("\n").filter(Boolean).length <= out(all).split("\n").filter(Boolean).length);
+      for (const line of out(filtered).split("\n").filter(Boolean)) {
         assert.ok(!line.split(":")[0].startsWith("src/"), `Excluded file leaked: ${line}`);
       }
     });
 
     it("should support comma-separated exclude patterns", async () => {
       const result = await grepExecute({ pattern: ".", exclude: "src/**,docs/**" }, ctx);
-      for (const line of result.split("\n").filter(Boolean)) {
+      for (const line of out(result).split("\n").filter(Boolean)) {
         const filePath = line.split(":")[0];
         assert.ok(!filePath.startsWith("src/") && !filePath.startsWith("docs/"), `Comma exclude leaked: ${filePath}`);
       }
@@ -396,7 +401,7 @@ describe("FffPlugin", () => {
 
     it("should trim whitespace around comma-separated patterns", async () => {
       const result = await grepExecute({ pattern: ".", exclude: " src/** , docs/** " }, ctx);
-      for (const line of result.split("\n").filter(Boolean)) {
+      for (const line of out(result).split("\n").filter(Boolean)) {
         const filePath = line.split(":")[0];
         assert.ok(!filePath.startsWith("src/") && !filePath.startsWith("docs/"), `Trimmed exclude leaked: ${filePath}`);
       }
@@ -405,8 +410,8 @@ describe("FffPlugin", () => {
     it("should exclude hidden files (.gitignore) with dot:true", async () => {
       const all = await grepExecute({ pattern: "node_modules" }, ctx);
       const filtered = await grepExecute({ pattern: "node_modules", exclude: ".gitignore" }, ctx);
-      if (all.includes(".gitignore")) {
-        assert.ok(!filtered.includes(".gitignore"), "Hidden file .gitignore should be excludable");
+      if (out(all).includes(".gitignore")) {
+        assert.ok(!out(filtered).includes(".gitignore"), "Hidden file .gitignore should be excludable");
       }
     });
   });
@@ -419,7 +424,7 @@ describe("FffPlugin", () => {
       const noCtx = await grepExecute({ pattern: "console.log", context: 0 }, ctx);
       const withCtx = await grepExecute({ pattern: "console.log", context: 1 }, ctx);
       assert.ok(
-        withCtx.split("\n").filter(Boolean).length >= noCtx.split("\n").filter(Boolean).length,
+        out(withCtx).split("\n").filter(Boolean).length >= out(noCtx).split("\n").filter(Boolean).length,
         "context=1 should return >= lines than context=0"
       );
     });
@@ -427,7 +432,7 @@ describe("FffPlugin", () => {
     it("context=0 should equal omitting context", async () => {
       const a = await grepExecute({ pattern: "console.log", context: 0 }, ctx);
       const b = await grepExecute({ pattern: "console.log" }, ctx);
-      assert.equal(a, b);
+      assert.equal(out(a), out(b));
     });
   });
 
@@ -437,20 +442,20 @@ describe("FffPlugin", () => {
   describe("grep limit", () => {
     it("should respect limit parameter", async () => {
       const result = await grepExecute({ pattern: ".", limit: 2 }, ctx);
-      const lines = result.split("\n").filter(Boolean);
+      const lines = out(result).split("\n").filter(Boolean);
       assert.ok(lines.length <= 2, `limit=2 returned ${lines.length} lines`);
     });
 
     it("limit=1 returns at most 1 line", async () => {
       const result = await grepExecute({ pattern: ".", limit: 1 }, ctx);
-      const lines = result.split("\n").filter(Boolean);
+      const lines = out(result).split("\n").filter(Boolean);
       assert.ok(lines.length <= 1);
     });
 
-    it("default limit should cap at 1000", async () => {
+    it("default limit should cap at 100", async () => {
       const result = await grepExecute({ pattern: "." }, ctx);
-      const lines = result.split("\n").filter(Boolean);
-      assert.ok(lines.length <= 1000, `Default limit exceeded: ${lines.length}`);
+      const lines = out(result).split("\n").filter(Boolean);
+      assert.ok(lines.length <= 100, `Default limit exceeded: ${lines.length}`);
     });
 
     it("should throw on negative limit", async () => {
@@ -500,8 +505,8 @@ describe("FffPlugin", () => {
   describe("grep regex mode", () => {
     it("should support regex patterns", async () => {
       const result = await grepExecute({ pattern: "export\\s+const" }, ctx);
-      assert.ok(result.length > 0, "Regex should match");
-      for (const line of result.split("\n").filter(Boolean)) {
+      assert.ok(out(result).length > 0, "Regex should match");
+      for (const line of out(result).split("\n").filter(Boolean)) {
         const content = line.split(":").slice(2).join(":");
         assert.ok(/export\s+const/.test(content), `Regex didn't match: ${content}`);
       }
@@ -509,7 +514,7 @@ describe("FffPlugin", () => {
 
     it("should handle invalid regex gracefully (fff falls back to literal)", async () => {
       const result = await grepExecute({ pattern: "[invalid" }, ctx);
-      assert.equal(typeof result, "string", "Invalid regex should not crash");
+      assert.equal(typeof result, "object", "Invalid regex should not crash");
     });
   });
 
@@ -519,23 +524,23 @@ describe("FffPlugin", () => {
   describe("glob basic", () => {
     it("should find files by fuzzy pattern", async () => {
       const result = await globExecute({ pattern: "foo" }, ctx);
-      assert.ok(result.length > 0, "Should find foo.js");
-      assert.ok(result.includes("foo.js"), `Missing foo.js in: ${result}`);
+      assert.ok(out(result).length > 0, "Should find foo.js");
+      assert.ok(out(result).includes("foo.js"), `Missing foo.js in: ${result}`);
     });
 
     it("should return newline-separated paths", async () => {
       const result = await globExecute({ pattern: "foo" }, ctx);
-      assert.ok(result.length > 0);
-      const lines = result.split("\n").filter(Boolean);
+      assert.ok(out(result).length > 0);
+      const lines = out(result).split("\n").filter(Boolean);
       for (const line of lines) {
-        // Should be relative paths, not absolute
-        assert.ok(!line.startsWith("/"), `Glob path should be relative: ${line}`);
+        // Upstream returns absolute paths; verify they're absolute
+        assert.ok(line.startsWith("/"), `Glob path should be absolute: ${line}`);
       }
     });
 
     it("should return empty string for no matches", async () => {
       const result = await globExecute({ pattern: "ZZZNONEXISTENT_FILE_ZZZ" }, ctx);
-      assert.equal(result, "");
+      assert.ok(!out(result) || out(result) === "No files found", "Expected empty/found output");
     });
 
     it("should throw on empty pattern", async () => {
@@ -558,13 +563,13 @@ describe("FffPlugin", () => {
     it("default (no type) should return files", async () => {
       const result = await globExecute({ pattern: "." }, ctx);
       // fff fileSearch returns FileItems which have relativePath (typically no trailing /)
-      assert.ok(result.length > 0, "Should find files");
+      assert.ok(out(result).length > 0, "Should find files");
     });
 
     it("type='directory' should return directory paths", async () => {
       const result = await globExecute({ pattern: ".", type: "directory" }, ctx);
-      assert.ok(result.length > 0, "Should find directories");
-      const lines = result.split("\n").filter(Boolean);
+      assert.ok(out(result).length > 0, "Should find directories");
+      const lines = out(result).split("\n").filter(Boolean);
       for (const line of lines) {
         // fff DirItem.relativePath typically ends with /
         assert.ok(
@@ -577,7 +582,7 @@ describe("FffPlugin", () => {
     it("invalid type value is silently ignored (Zod optional enum coerces to undefined)", async () => {
       // Zod enum with optional() means invalid values become undefined, falling to default file search
       const result = await globExecute({ pattern: "foo", type: "invalid" }, ctx);
-      assert.equal(typeof result, "string", "Invalid type should not crash");
+      assert.equal(typeof result, "object", "Invalid type should not crash");
     });
   });
 
@@ -587,15 +592,17 @@ describe("FffPlugin", () => {
   describe("glob path filtering", () => {
     it("should scope results to a subdirectory", async () => {
       const result = await globExecute({ pattern: ".", path: "src" }, ctx);
-      for (const line of result.split("\n").filter(Boolean)) {
-        assert.ok(line === "src" || line.startsWith("src/"), `Glob path filter failed: ${line}`);
+      for (const line of out(result).split("\n").filter(Boolean)) {
+        // Absolute paths; verify they contain src/ path component
+        assert.ok(line.startsWith(tmpDir) && (line.endsWith("/src") || line.includes("/src/")),
+          `Glob path filter failed: ${line}`);
       }
     });
 
     it("should normalize trailing slashes", async () => {
       const a = await globExecute({ pattern: ".", path: "src/" }, ctx);
       const b = await globExecute({ pattern: ".", path: "src" }, ctx);
-      assert.equal(a, b);
+      assert.equal(out(a), out(b));
     });
   });
 
@@ -605,7 +612,7 @@ describe("FffPlugin", () => {
   describe("glob limit", () => {
     it("should respect limit parameter", async () => {
       const result = await globExecute({ pattern: ".", limit: 2 }, ctx);
-      const lines = result.split("\n").filter(Boolean);
+      const lines = out(result).split("\n").filter(Boolean);
       assert.ok(lines.length <= 2, `limit=2 returned ${lines.length} results`);
     });
   });
@@ -627,17 +634,17 @@ describe("FffPlugin", () => {
   describe("edge cases", () => {
     it("grep with special regex characters", async () => {
       const result = await grepExecute({ pattern: "(import|export)" }, ctx);
-      assert.equal(typeof result, "string");
+      assert.equal(typeof result, "object");
     });
 
     it("grep with very long pattern", async () => {
       const result = await grepExecute({ pattern: "a".repeat(1000) }, ctx);
-      assert.equal(typeof result, "string");
+      assert.equal(typeof result, "object");
     });
 
     it("grep with single character pattern", async () => {
       const result = await grepExecute({ pattern: "a" }, ctx);
-      assert.equal(typeof result, "string");
+      assert.equal(typeof result, "object");
     });
 
     it("grep literal text with regex metacharacters (parens)", async () => {
@@ -645,9 +652,9 @@ describe("FffPlugin", () => {
       // This test documents current behavior: foo(bar) is an invalid regex capture group
       // and fff falls back to literal matching.
       const result = await grepExecute({ pattern: "foo(bar)" }, ctx);
-      const lines = result.split("\n").filter(Boolean);
+      const lines = out(result).split("\n").filter(Boolean);
       // fff's fallback for invalid regex may still match — verify it doesn't crash
-      assert.equal(typeof result, "string");
+      assert.equal(typeof result, "object");
       const metaLines = lines.filter(l => l.includes("metachars.js"));
       if (metaLines.length > 0) {
         // fff fell back to literal matching — the line exists
@@ -662,29 +669,29 @@ describe("FffPlugin", () => {
       // In regex mode, this matches 'file1.txt' (no dot needed). This documents
       // that always-regex-mode can produce unexpected literal matches.
       const result = await grepExecute({ pattern: "file[1].txt" }, ctx);
-      assert.equal(typeof result, "string");
+      assert.equal(typeof result, "object");
     });
 
     it("grep literal text with regex metacharacters (dot)", async () => {
       // In regex mode, 'example.com' matches 'example<any_char>com'
       // This is the expected regex behavior for unescaped dots.
       const result = await grepExecute({ pattern: "example.com" }, ctx);
-      assert.equal(typeof result, "string");
-      if (result.length > 0) {
+      assert.equal(typeof result, "object");
+      if (out(result).length > 0) {
         // The dot matched literally because the content is exactly "example.com"
-        const metaLines = result.split("\n").filter(Boolean).filter(l => l.includes("metachars.js"));
+        const metaLines = out(result).split("\n").filter(Boolean).filter(l => l.includes("metachars.js"));
         assert.ok(metaLines.length > 0, "'example.com' regex should match metachars.js");
       }
     });
 
     it("glob with special characters in pattern", async () => {
       const result = await globExecute({ pattern: "foo.js" }, ctx);
-      assert.equal(typeof result, "string");
+      assert.equal(typeof result, "object");
     });
 
     it("grep with path + exclude combined", async () => {
       const result = await grepExecute({ pattern: ".", path: "src", exclude: "src/components/**" }, ctx);
-      for (const line of result.split("\n").filter(Boolean)) {
+      for (const line of out(result).split("\n").filter(Boolean)) {
         const filePath = line.split(":")[0];
         assert.ok(!filePath.startsWith("src/components/"), `Combined filter failed: ${filePath}`);
       }
@@ -699,8 +706,8 @@ describe("FffPlugin", () => {
         context: 1,
         limit: 50,
       }, ctx);
-      assert.equal(typeof result, "string");
-      for (const line of result.split("\n").filter(Boolean)) {
+      assert.equal(typeof result, "object");
+      for (const line of out(result).split("\n").filter(Boolean)) {
         const filePath = line.split(":")[0];
         assert.ok(filePath.startsWith("src/"), `Combined params failed: ${filePath}`);
         assert.ok(!filePath.includes("bar.js"), `Exclude failed: ${filePath}`);
@@ -710,7 +717,7 @@ describe("FffPlugin", () => {
     it("plugin handles undefined args gracefully", async () => {
       // OpenCode might pass extra/undefined fields
       const result = await grepExecute({ pattern: "foo", extraField: "ignored" }, ctx);
-      assert.equal(typeof result, "string");
+      assert.equal(typeof result, "object");
     });
 
     it("multiple concurrent grep calls should work (shared scanPromise)", async () => {
@@ -719,9 +726,9 @@ describe("FffPlugin", () => {
         grepExecute({ pattern: "bar" }, ctx),
         grepExecute({ pattern: "export" }, ctx),
       ]);
-      assert.equal(typeof r1, "string");
-      assert.equal(typeof r2, "string");
-      assert.equal(typeof r3, "string");
+      assert.equal(typeof r1, "object");
+      assert.equal(typeof r2, "object");
+      assert.equal(typeof r3, "object");
     });
   });
 
@@ -734,7 +741,7 @@ describe("FffPlugin", () => {
       // file has more matches than one page's worth of files can cover.
       // Use pattern "." to match every line in every file.
       const result = await grepExecute({ pattern: ".", limit: 50 }, ctx);
-      const lines = result.split("\n").filter(Boolean);
+      const lines = out(result).split("\n").filter(Boolean);
       assert.ok(lines.length > 0, "Should find at least some matches");
       assert.ok(lines.length <= 50, `limit=50 should return ≤50 lines, got ${lines.length}`);
     });
@@ -743,21 +750,21 @@ describe("FffPlugin", () => {
       // Pattern that matches many lines across many files — exercises
       // the pagination loop path. Should not throw.
       const result = await grepExecute({ pattern: ".", limit: 500 }, ctx);
-      assert.equal(typeof result, "string");
-      const lines = result.split("\n").filter(Boolean);
+      assert.equal(typeof result, "object");
+      const lines = out(result).split("\n").filter(Boolean);
       assert.ok(lines.length > 0, "Should return results");
       assert.ok(lines.length <= 500, `limit=500 returned ${lines.length} lines`);
     });
 
     it("limit=1 returns at most 1 result (pagination stops early)", async () => {
       const result = await grepExecute({ pattern: "export", limit: 1 }, ctx);
-      const lines = result.split("\n").filter(Boolean);
+      const lines = out(result).split("\n").filter(Boolean);
       assert.ok(lines.length <= 1, `limit=1 returned ${lines.length} lines`);
     });
 
     it("pagination + path filtering: returns results only within path", async () => {
       const result = await grepExecute({ pattern: ".", path: "src", limit: 30 }, ctx);
-      const lines = result.split("\n").filter(Boolean);
+      const lines = out(result).split("\n").filter(Boolean);
       assert.ok(lines.length <= 30, `limit=30 returned ${lines.length}`);
       for (const line of lines) {
         const filePath = line.split(":")[0];

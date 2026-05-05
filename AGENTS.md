@@ -4,41 +4,110 @@ This document provides essential context for AI agents working on the opencode-f
 
 ## Project Overview
 
-OpenCode plugin that replaces OpenCode's default `grep` and `glob` file search tools with [fff.nvim](https://github.com/dmtrKovalenko/fff.nvim)'s ultra-fast, typo-resistant, frecency-ranked search engine.
+OpenCode plugin that replaces OpenCode's built-in `grep` and `glob` file search tools with [fff](https://github.com/dmtrKovalenko/fff)'s ultra-fast, typo-resistant search engine.
 
 **Key characteristics:**
 - Single-file ES module plugin (`index.js`)
 - No build step required
 - Node.js 18+ required (ES modules)
-- Uses `@ff-labs/fff-node` (Rust-based fast search) and `minimatch` for glob matching
-- Returns results as strings (not objects) to match OpenCode's ToolResult contract
+- Uses `@ff-labs/fff-node` ^0.7.0 (Rust-based fast search) and `minimatch` for glob matching
+- Returns `{ output, metadata }` objects so OpenCode's TUI renders match counts inline
+- **Full feature set** — grep (pattern, path, include, exclude, caseSensitive, context, limit), glob (pattern, path, type, limit)
+- **Single-file 100% recall** — When path points to a file, reads it directly bypassing fff index
+- **aiMode enabled** — Frecency scoring on by default for better recall and ranking
+- **Smart mode detection** — Detects regex vs plain patterns; plain uses SIMD-accelerated literal matching
 
 ## Architecture
 
 ### Plugin Structure
 
-The plugin exports a single async function `FffPlugin` that:
+The plugin exports an async default function `(input)` that:
 
-1. **Initializes** a `FileFinder` instance from `@ff-labs/fff-node` with `aiMode: false`
-2. **Creates a shared `scanPromise`** to avoid multiple concurrent index scans (critical for performance)
-3. **Returns tool definitions** that override OpenCode's built-in `grep` and `glob` tools
+1. **Initializes** a `FileFinder` instance from `@ff-labs/fff-node` with safe defaults
+2. **Caches** one `FileFinder` per directory (module-level `instances` Map) to prevent native resource leaks
+3. **Creates a shared `scanPromise`** to avoid multiple concurrent index scans
+4. **Returns tool definitions** that override OpenCode's built-in `grep` and `glob` tools
 
 ### Data Flow
 
 ```
-OpenCode tool call → FffPlugin.execute() → fff FileFinder → Format result → Return string
+grep:
+  File path      → directFileGrep (Node.js readFileSync) → format
+  Unicode pattern → fsGrep (readdirSync + readFileSync + Unicode regex) → post-filter → format
+  Outside index  → fsGrep (path outside basePath) → format
+  ASCII pattern  → fff grep (plain or regex mode) → if zero → plain→regex retry → fsGrep fallback → post-filter → format
+
+glob:
+  Metachar + type=directory → globWalk directly (fff directorySearch is fuzzy, not glob-aware)
+  Metachar + type=file      → fff fileSearch → minimatch post-filter → globWalk fallback → absolute paths → format
+  Fuzzy query               → fff fileSearch/directorySearch → filter by path → globWalk fallback → absolute paths → format
+  Fuzzy query (no exact match) → fff fileSearch + globWalk augmentation → absolute paths → format
 ```
 
-- **grep tool**: Returns `"file:line_number:line_content"` format, one per line
-- **glob tool**: Returns newline-separated file/directory paths
+### Tool Output Format
+
+- **grep tool**: Returns `{ title, output: string, metadata: { matches: number, truncated: boolean } }`
+  - Output format: `relativePath:lineNumber:lineContent` (one line per match)
+  - When `context > 0`: renders `contextBefore` lines, match line, `contextAfter` lines with correct line numbers
+  - Default limit: 100 matches, configurable 1–5000
+- **glob tool**: Returns `{ title, output: string, metadata: { count: number, truncated: boolean } }`
+  - Output format: newline-separated absolute file paths
+  - Default limit: 100 results, configurable 1–5000
 
 ### Key Components
 
-- `FileFinder.create({ basePath: directory, aiMode: false })` - Initializes fff search engine
-- `finder.waitForScan(15000)` - Waits for initial index build (15s timeout)
-- `finder.grep(pattern, opts)` - Content search with smart case, context, limits
-- `finder.fileSearch(pattern, { pageSize })` - Fuzzy file search
-- `finder.directorySearch(pattern, { pageSize })` - Fuzzy directory search
+- `FileFinder.create({ basePath, ...config })` — Initializes fff search engine with aiMode enabled
+- `instances` Map — Module-level cache: one `{ finder, scanPromise }` per directory
+- `finder.waitForScan(15000)` — Waits for initial index build (15s timeout)
+- `detectGrepMode(pattern)` — Returns `"regex"` or `"plain"` based on regex metachar detection
+- `finder.grep(pattern, opts)` — Content search with regex/plain mode + smart case + cursor pagination
+- `directFileGrep(filePath, basePath, pattern, ctxLines)` — Direct file read for 100% recall on single-file searches
+- `fsGrep(dir, basePath, pattern, ctxLines, pathFilter, include, exclude)` — Directory-level grep for non-ASCII (Unicode/Turkish) patterns; walks dirs with readdirSync and reads files with readFileSync using exact Unicode regex (`u` flag). Bypasses fff's Unicode normalization to avoid `ş↔s` overcount. Applies include/exclude during traversal.
+- `globWalk(dir, pattern, basePath, limit, type)` — Real glob matching via recursive readdir + minimatch (supports file/directory type)
+- `loadGitignoreFilter(basePath)` — Reads `.gitignore` and augments `SKIP_DIRS` with directory-name entries; cached per basePath. Used by `fsGrep` and `globWalk`.
+- `fetchGrepPages(finder, pattern, opts, limit, abort, client)` — Cursor-based pagination across fff's 50-item pages; page ceiling = `ceil(limit/50) + 2`
+- `filterByPath(items, pathKey, targetPath)` — Post-filter results to a subdirectory or file
+- `filterByGlob(items, pattern)` — Post-filter results by include glob pattern
+- `filterByExclude(items, exclude)` — Post-filter results by exclude glob pattern
+- `waitForScan(scanPromise, timeoutMs)` — Race between scan completion and timeout, never throws
+- `safeLog(client, level, message)` — Logging that never throws
+
+### Configuration
+
+The plugin uses hardcoded defaults with all fff features enabled:
+
+```javascript
+// Hardcoded defaults in FileFinder.create()
+{
+  aiMode: true,                // Frecency DB enabled (improves recall)
+  disableMmapCache: false,     // Enable mmap cache for speed
+  disableContentIndexing: false, // Bigram inverted index (5-20x grep speedup, no recall impact)
+  disableWatch: false,         // Enable file watcher (detects new/deleted files)
+}
+```
+
+All features are enabled for maximum search performance. The bigram content index pre-filters files before opening them — it does not affect recall, only eliminates files that cannot match the query pattern.
+
+### Skipped Directories
+
+`SKIP_DIRS` — hardcoded baseline set, augmented at runtime by `loadGitignoreFilter`:
+
+```javascript
+const SKIP_DIRS = new Set([
+  ".git", "node_modules", ".hg", ".svn",
+  "__pycache__", ".cache", "dist", ".next",
+  "coverage", ".nyc_output", "build", "out",
+  ".nuxt", ".output", ".vercel", ".terraform",
+])
+```
+
+`loadGitignoreFilter(basePath)` reads `.gitignore` from disk and extracts simple directory-name
+patterns (e.g., `vendor/`, `generated/`) into the skip set. Results are cached per `basePath`.
+
+`globWalk` and `fsGrep` skip all dot-prefixed directories (except the search root).
+
+fff's own index respects `.gitignore` natively via the Rust `ignore` crate (same library ripgrep uses).
+This means `SKIP_DIRS` is only needed for the filesystem fallback functions.
 
 ## Essential Commands
 
@@ -64,11 +133,11 @@ opencode debug config --print-logs 2>&1 | grep fff
 ```bash
 # For development testing (global OpenCode config)
 ln -sf $(pwd)/index.js ~/.config/opencode/plugins/opencode-fff-search.js
-cd ~/.config/opencode && bun install @ff-labs/fff-node @opencode-ai/plugin
+cd ~/.config/opencode && npm install
 
 # For project-local testing
 mkdir -p .opencode/plugins && cp index.js .opencode/plugins/
-cd .opencode && bun install
+cd .opencode && npm install
 
 # Using the install script (Linux/macOS only)
 ./install.sh
@@ -101,35 +170,46 @@ npm view opencode-fff-search version
 ### Patterns
 
 ```javascript
-// Tool definition pattern
+// Tool definition pattern — extends upstream with exclude, context, limit
 tool({
   description: "...",
   args: {
-    param: tool.schema.string().optional(),
+    pattern: tool.schema.string().describe("Search pattern"),
+    path: tool.schema.string().optional(),
+    exclude: tool.schema.string().optional(),
+    caseSensitive: tool.schema.boolean().optional(),
+    context: tool.schema.number().optional(),
+    limit: tool.schema.number().optional(),
   },
   async execute(args, context) {
-    // 1. Check abort early
-    if (context.abort.aborted) throw new Error("Aborted");
+    // 1. Validate + abort check
+    if (!args.pattern || typeof args.pattern !== "string" || args.pattern.trim() === "")
+      throw new Error("pattern must be a non-empty string")
+    if (context.abort.aborted) throw new Error("Aborted")
 
-    // 2. Wait for scan (with timeout)
-    await Promise.race([
-      scanPromise.then(() => { scanCompleted = true; }),
-      new Promise((resolve) => setTimeout(resolve, 5000)),
-    ]);
+    // 2. Wait for scan
+    await waitForScan(scanPromise, TOOL_TIMEOUT_MS)
+    if (context.abort.aborted) throw new Error("Aborted")
 
-    // 3. Check abort again after async work
-    if (context.abort.aborted) throw new Error("Aborted");
-
-    // 4. Execute search
-    const result = finder.grep(args.pattern, opts);
-
-    // 5. Filter/validate results
+    // 3. Detect single-file vs directory search
+    let resolvedFilePath = null
     if (args.path) {
-      // Filter by path
+      const resolvedPath = resolvePath(directory, args.path)
+      if (existsSync(resolvedPath) && statSync(resolvedPath).isFile()) resolvedFilePath = resolvedPath
     }
 
-    // 6. Return string, not object
-    return formattedString;
+    // 4. Execute search
+    let matches
+    if (resolvedFilePath) {
+      matches = directFileGrep(resolvedFilePath, directory, args.pattern, ctxLines)
+    } else {
+      // ... routing logic (see Data Flow above)
+    }
+
+    // 5. Post-filter by path, exclude
+    // 6. Sort by mtime, apply limit
+    // 7. Return { title, output, metadata }
+    return { title: args.pattern, metadata: { matches: total, truncated }, output: output.join("\n") }
   },
 })
 ```
@@ -138,180 +218,185 @@ tool({
 
 ```javascript
 try {
-  const result = finder.grep(args.pattern, opts);
+  const result = finder.grep(args.pattern, { mode, smartCase: true })
   if (!result.ok) {
-    await safeLog(client, "error", `fff grep error: ${result.error}`);
-    throw new Error(`fff grep error: ${result.error}`);
+    await safeLog(client, "error", `fff grep error: ${result.error}`)
+    throw new Error(`fff grep error: ${result.error}`)
   }
-  // Process result...
 } catch (err) {
-  await safeLog(client, "error", `grep error: ${err.message}`);
-  throw err; // Re-throw to surface error to user
+  await safeLog(client, "error", `grep error: ${err.message}`)
+  throw err
 }
 ```
 
 ### Logging
 
-Use structured logging via `client.app.log()`:
-
-```javascript
-await client.app.log({
-  body: {
-    service: "fff-plugin",
-    level: "info", // or "error", "warn", "debug"
-    message: "Description of what happened"
-  }
-});
-```
-
-**Important**: Keep logs minimal. Recent cleanup removed debug logs that polluted output. Only log:
-- Initialization/scan completion (info)
-- Errors (error)
-- Warnings about timeouts (warn)
+Use structured logging via `client.app.log()`. Keep logs minimal — only initialization, scan completion, and errors. Always use `safeLog` (never throws).
 
 ## Critical Implementation Details
-## SIGBUS Prevention
 
-The plugin disables mmap caching in `FileFinder.create()`:
+### Upstream Contract Alignment
 
-```javascript
-const initResult = FileFinder.create({
-  basePath: directory,
-  aiMode: false,           // Disable frecency DB (LMDB mmap source)
-  disableMmapCache: true,  // Prevents SIGBUS on file truncation
-  disableContentIndexing: true, // Explicitly disable content index (mmap source)
-  disableWatch: true,      // Disabled due to upstream stack overflow (fff.nvim#422)
-});
-```
+The plugin extends the upstream OpenCode tool contracts:
 
-**Why mmap is disabled**: fff maps indexed files into memory via `mmap()`. If any
-process truncates or deletes a mapped file, reading it triggers SIGBUS (unrecoverable).
-OpenCode's agent workload constantly mutates files (edits, git ops, session writes). Standard
-`read()` syscalls are used instead — performance impact is negligible.
+**grep** ([upstream source](https://github.com/anomalyco/opencode/blob/main/packages/opencode/src/tool/grep.ts)):
+- Upstream: 3 parameters (`pattern`, `path`, `include`)
+- **Extensions**: `exclude` (post-filter), `caseSensitive` (overrides smart case), `context` (fff native), `limit` (configurable 1–5000)
+- Uses `detectGrepMode()` to choose `"plain"` (SIMD) vs `"regex"` mode
+- Single-file search: reads file directly for 100% recall (bypasses fff)
+- Default limit 100, max 5000
+- Output: `relativePath:lineNumber:lineContent` per line (context lines rendered before/after match when `context > 0`)
+- Truncation notice: `(Results are truncated: showing first ${limit} results ...)`
 
-**Why watch is disabled**: The file watcher is temporarily disabled (`disableWatch: true`)
-due to an upstream stack overflow bug in fff-node v0.6.4
-([fff.nvim#422](https://github.com/dmtrKovalenko/fff.nvim/issues/422)).
-New files created during a session will not appear in search until OpenCode restarts.
-
-**Known issue**: `finder.destroy()` blocks indefinitely when the watcher is active (native
-thread join). This is a fff-node bug but doesn't affect normal operation since the plugin
-never destroys the finder mid-session.
-
-See [SIGBUS_INVESTIGATION.md](./SIGBUS_INVESTIGATION.md) for full root cause analysis.
+**glob** ([upstream source](https://github.com/anomalyco/opencode/blob/main/packages/opencode/src/tool/glob.ts)):
+- Upstream: 2 parameters (`pattern`, `path`)
+- **Extensions**: `type` (file/directory), `limit` (configurable 1–5000)
+- Metachar patterns: fff fuzzy + minimatch post-filter + `globWalk` fallback
+- Fuzzy queries: fff `fileSearch`/`directorySearch` + `globWalk` fallback
+- `globWalk` triggers on ALL empty-result cases (not just metachar)
+- fff items normalized to always have `relativePath` and `fileName`
+- Default limit 100, max 5000
+- Output: newline-separated **absolute** file paths (matches upstream behavior)
 
 ### Tool Return Format
 
-**CRITICAL**: Both tools must return **strings**, not objects. This is required by OpenCode's ToolResult contract.
-
-- **grep**: Returns `"file:line_number:line_content"` joined by newlines
-- **glob**: Returns file/directory paths joined by newlines
+**CRITICAL**: Both tools must return `{ output, metadata }` objects, not plain strings.
 
 ```javascript
-// Correct - returns string
-return lines.join('\n');
+// Correct
+return { title: args.pattern, metadata: { matches: total, truncated }, output: output.join("\n") }
 
-// Incorrect - returns object
-return { files: lines, metadata: {...} };
+// Incorrect — TUI shows no match count
+return lines.join('\n')
 ```
 
-### Shared scanPromise Pattern
+### Path Handling
 
-The plugin uses a shared `scanPromise` to prevent multiple concurrent scans when multiple tool calls happen simultaneously:
-
-```javascript
-const scanPromise = finder.waitForScan(15000).catch(() => undefined);
-scanPromise.then(() => {
-  client.app.log({ body: { service: "fff-plugin", level: "info", message: "Initial fff scan complete" } });
-});
-```
-
-In each tool execute, wait for scan with timeout:
+Matches upstream behavior:
+- **Absolute paths** — resolved as-is, then converted to relative for filtering
+- **Relative paths** — joined with workspace `directory`
+- **Falsy/omitted** — uses workspace `directory`
 
 ```javascript
-await Promise.race([
-  scanPromise.then(() => { scanCompleted = true; }),
-  new Promise((resolve) => setTimeout(resolve, 5000)),
-]);
-```
-
-This ensures the index is built (or 5s elapsed) before searching, without blocking forever.
-
-### Abort Handling
-
-OpenCode can abort tool calls (e.g., user presses Escape). Check `context.abort.aborted`:
-
-```javascript
-// At start
-if (context.abort.aborted) throw new Error("Aborted");
-
-// After async operations
-if (context.abort.aborted) throw new Error("Aborted");
-```
-
-### Smart Case Logic
-
-The `caseSensitive` parameter has non-obvious behavior:
-
-- If `caseSensitive: true` (explicit), then `smartCase: false`
-- If `caseSensitive: false` or undefined, then `smartCase: true`
-- Smart case: pattern with uppercase → case-sensitive; all lowercase → case-insensitive
-
-**Search mode auto-detection**: The `detectGrepMode` function identifies regex patterns by checking for metacharacters. It correctly identifies escaped characters like `\.`, `\(`, `\)`, etc. because any backslash `\` triggers regex mode.
-
-### Path Filtering
-
-Path filtering normalizes trailing slashes and supports exact match or prefix.
-**Important**: Root paths (`"."`, `"./"`, `"/"`) and absolute paths are treated as "search everything" and skip filtering to ensure agent compatibility.
-
-```javascript
-function filterByPath(items, pathKey, targetPath) {
-  if (!targetPath) return items;
-  if (ROOT_PATH_RE.test(targetPath)) return items;
-  if (targetPath.startsWith("/")) return items;
-  const target = targetPath.replace(/\/+$/, ""); // TRAILING_SLASH_RE
-  return items.filter((m) => m.relativePath === target || m.relativePath.startsWith(target + "/"));
+function resolvePath(directory, p) {
+  if (!p) return directory
+  if (isAbsolute(p)) return p
+  return join(directory, p)
 }
 ```
 
-### Exclude Patterns
+### Smart Mode Detection (`detectGrepMode`)
 
-Uses `minimatch` library for glob pattern matching:
+```javascript
+const REGEX_METACHAR_RE = /\\[sdwnbtDSWNBT]|\\|\||\[\^?\]|\[\^?[^\]]+\]|\\\+|\\\*|\\\?|[\^\$]/;
+```
+
+Patterns with `\s`, `\d`, `|`, `[abc]`, `^`, `$`, etc. → `"regex"` mode.
+Everything else → `"plain"` mode (SIMD-accelerated literal matching).
+
+This is necessary because regex mode silently drops literal metacharacters: `foo(bar)` in regex mode would fail to match the literal parentheses. Plain mode handles this correctly.
+
+**Failsafe**: If plain mode returns zero results, the plugin retries with regex mode automatically.
+
+### Exclude Parameter Filtering
+
+The `exclude` parameter matches against **both** `relativePath` and `fileName`. This is necessary because `minimatch("dir/Foo.vue", "*.vue")` returns false (`*` doesn't match `/`):
 
 ```javascript
 if (args.exclude) {
-  const patterns = args.exclude.split(",").map((p) => p.trim()).filter(Boolean);
-  matches = matches.filter((m) => !patterns.some((pat) => minimatch(m.relativePath, pat, { dot: true })));
+  const patterns = args.exclude.split(",").map((p) => p.trim()).filter(Boolean)
+  matches = matches.filter((m) =>
+    !patterns.some((pat) =>
+      minimatch(m.relativePath, pat, { dot: true }) ||
+      minimatch(m.fileName, pat, { dot: true })
+    )
+  )
 }
 ```
 
-**Note**: `{ dot: true }` ensures patterns match hidden files (like `.gitignore`).
+### Glob Tool: Glob vs Fuzzy Routing
 
-### Limit Validation
+The glob tool detects whether the pattern contains glob metacharacters (`*`, `?`, `[`):
+- **Glob patterns + type=directory** — skips fff's `directorySearch` (which is fuzzy, not glob-aware) and uses `globWalk` directly for proper minimatch matching
+- **Glob patterns + type=file** → fff fuzzy search → minimatch post-filter → `globWalk` fallback
+  - `globWalk()` uses recursive `readdirSync` + `minimatch`
+  - Supports recursive `**/`, brace expansion (`*.{ts,js}`), and character classes via `minimatch`
+  - Directory matching checks both `relativePath` and `entry.name` so `*` matches nested dirs
+- **Fuzzy queries** (`helpers`, `config`) → fff `fileSearch()` / `directorySearch()` → `globWalk` fallback
+- **Exact-name augmentation**: for non-metachar patterns, if fff's fuzzy results don't include an exact basename match, `globWalk` runs to find and augment with the real file
 
-Always validate limits to prevent negative/zero values. Use `!= null` to catch `0`:
+`globWalk` triggers for **all** empty-result cases, not just metachar patterns. For non-metachar patterns with non-empty fuzzy results, `globWalk` also runs if no result has an exact basename match — augmenting the fuzzy results with the real file.
+
+### Glob Item Normalization
+
+fff's `directorySearch` and `fileSearch` may return items with `path` instead of `relativePath`, or missing `fileName`. The plugin normalizes all items:
 
 ```javascript
-// Validation (throws on 0, negative, or > MAX_LIMIT)
-if (args.limit != null && (typeof args.limit !== "number" || args.limit < 1 || args.limit > MAX_LIMIT)) {
-  throw new Error(`limit must be a number between 1 and ${MAX_LIMIT}`);
-}
-
-// Apply validated limit with fallback default
-const limit = Math.max(1, args.limit || DEFAULT_GREP_LIMIT);
-const pageSize = Math.max(1, args.limit || DEFAULT_GLOB_LIMIT);
+items = (result.value?.items || []).map((item) => ({
+  relativePath: item.relativePath || item.path || "",
+  fileName: item.fileName || (item.relativePath || item.path || "").split("/").pop() || "",
+}))
 ```
-### fff API Result Handling
 
-All fff API calls return a Result type with `ok` boolean:
+This prevents `undefined.split()` crashes in downstream `minimatch`/`filterByPath`/`join` calls.
+
+### Content Indexing (Bigram Prefilter)
+
+All fff features are enabled in `FileFinder.create()`:
 
 ```javascript
-const result = finder.grep(args.pattern, opts);
-if (!result.ok) {
-  // Handle error
-  throw new Error(`fff grep error: ${result.error}`);
+{
+  aiMode: true,                // Frecency DB enabled (improves recall)
+  disableMmapCache: false,     // Memory-mapped file cache for speed
+  disableContentIndexing: false, // Bigram inverted index (5-20x grep speedup)
+  disableWatch: false,         // File watcher (detects new/deleted files)
 }
-const matches = result.value.items;  // Success: access .value
+```
+
+**How the bigram content index works**: fff builds a character-pair (bigram) inverted index from file contents during the initial scan. Each bigram maps to a bitset of files containing that pair. During grep, the engine ANDs posting lists for the query pattern to produce a candidate file set, eliminating 80-95% of files before opening any file. The actual grep then does exhaustive line-by-line matching (SIMD `memchr` for plain text, `regex` crate for patterns) within candidate files only.
+
+**No recall impact**: The bigram prefilter is conservative — a file is only skipped if it lacks all bigrams from the query. This cannot produce false negatives. The recall gap in fff's grep comes from its fuzzy file finder (tokenization), not from content indexing.
+
+**Non-ASCII content**: The bigram index only tracks printable ASCII pairs (chars 32-126). Files with only non-ASCII content pass through to the full grep unfiltered, which is why the plugin's Unicode routing to `fsGrep` is correct.
+
+### Known Limitations
+
+#### Turkish/Unicode Overcount (Solved)
+fff's search engine performs Unicode normalization that maps `ş` (U+015F) to ASCII `s`, inflating match counts for Turkish patterns. The plugin detects non-ASCII patterns via `/[^\x00-\x7F]/` and routes them to `fsGrep` — a file-level read with exact Unicode regex (`giu` flags). Patterns containing characters like `ş`, `ı`, `İ`, `ğ`, `ü`, `ö`, `ç` produce exact counts matching bash `grep`.
+
+#### Case-Insensitive Matching for Turkish Uppercase (fff Limitation)
+fff's case folding is ASCII-only. When `smartCase` is enabled and the pattern is uppercase (e.g., `ISTANBUL`), fff performs case-sensitive matching and won't find Turkish title-case text like `İstanbul` because `I` ≠ `İ` in ASCII. **Workaround**: Use lowercase patterns for case-insensitive search (e.g., `istanbul` matches `İstanbul`). For exact uppercase Turkish matching, use `caseSensitive: true` with the exact Unicode pattern.
+
+#### Regex Support (Basic)
+fff supports basic regex: character classes (`[abc]`), quantifiers (`+`, `*`, `?`), alternation (`|`), anchors (`^`, `$`), escaped classes (`\s`, `\d`, `\w`). Advanced PCRE features are **not** supported: non-capturing groups (`(?:...)`), inline flags (`(?i)`), look-ahead/behind, backreferences. Use the `caseSensitive` parameter instead of inline flags.
+
+#### Keyword Search (Inherent fff Limitation)
+fff's grep indexes symbol tokens (identifiers, component names) but not language keywords (`import`, `const`, `return`, `export`). Plugin cannot override this for ASCII patterns. For keyword search, agents should fall back to bash `grep`/`rg`.
+
+#### Grep Recall Gap (Mitigated)
+fff's grep engine does not guarantee 100% recall across all files — coverage is high for symbol names and identifiers but inconsistent for short/common words. Not related to file size or content type.
+
+**Mitigation**: When `path` points to a specific file, the plugin reads it directly for 100% recall (`directFileGrep`). For non-ASCII patterns, `fsGrep` provides exact file-level coverage. For directory-wide ASCII searches, the plugin auto-falls back to `fsGrep` when fff returns zero results. For guaranteed 100% recall, agents should fall back to bash `grep`/`rg`.
+
+**Smart case**: Uppercase/mixed-case patterns search case-sensitively. Lowercase patterns are case-insensitive. Matches ripgrep's `--smart-case` behavior. Override with explicit `caseSensitive` parameter.
+
+**Important**: fff's smart case is ASCII-only. `ISTANBUL` won't match `İstanbul` case-insensitively because `I` ≠ `İ` in ASCII case folding. Use lowercase patterns for Turkish case-insensitive search.
+
+### Shared scanPromise Pattern
+
+```javascript
+const scanPromise = finder.waitForScan(SCAN_TIMEOUT_MS).catch(() => undefined)
+scanPromise.then(() => safeLog(client, "info", "Initial fff scan complete"))
+```
+
+### Abort Handling
+
+Check `context.abort.aborted` at start and after async operations:
+
+```javascript
+if (context.abort.aborted) throw new Error("Aborted")
+await waitForScan(scanPromise, TOOL_TIMEOUT_MS)
+if (context.abort.aborted) throw new Error("Aborted")
 ```
 
 ## Tool Parameters Reference
@@ -320,31 +405,32 @@ const matches = result.value.items;  // Success: access .value
 
 | Parameter | Type | Default | Notes |
 |-----------|------|---------|-------|
-| `pattern` | string (required) | — | Search pattern |
-| `path` | string (optional) | — | Subdirectory filter |
-| `exclude` | string (optional) | — | Comma-separated glob patterns |
-| `caseSensitive` | boolean (optional) | false (smart case) | Pass `true` for strict case-sensitive |
-| `context` | number (optional) | 0 | Lines before/after match |
-| `limit` | number (optional) | 1000 | Max total matches to return |
+| `pattern` | string (required) | — | Search pattern (regex or literal text) |
+| `path` | string (optional) | — | File or directory to search in (absolute or relative) |
+| `include` | string (optional) | — | File pattern to include (e.g., `"*.vue"`, `"*.{ts,tsx}"`) |
+| `exclude` | string (optional) | — | Comma-separated glob patterns to exclude |
+| `caseSensitive` | boolean (optional) | `false` | Override smart case. `true` = always case-sensitive. |
+| `context` | number (optional) | `0` | Context lines before/after each match |
+| `limit` | number (optional) | `100` | Max matches to return (1–5000) |
 
-**Output format**: `"file:line_number:line_content\nfile:line_number:line_content\n..."`
+**Output format**: `relativePath:lineNumber:lineContent` (one line per match). Context lines rendered before/after match with correct line numbers when `context > 0`.
 
 ### glob Tool
 
 | Parameter | Type | Default | Notes |
 |-----------|------|---------|-------|
-| `pattern` | string (required) | — | Search pattern |
-| `path` | string (optional) | — | Subdirectory filter |
-| `type` | "file" or "directory" (optional) | "file" | Filter results by type |
-| `limit` | number (optional) | 100 | Max results to return |
+| `pattern` | string (required) | — | Glob pattern or fuzzy query |
+| `path` | string (optional) | — | Directory to search in (absolute or relative) |
+| `type` | "file" or "directory" (optional) | "file" | Filter by type |
+| `limit` | number (optional) | `100` | Max results to return (1–5000) |
 
-**Output format**: `"file1.js\nfile2.js\n..."` or `"dir1/\ndir2/\n..."`
+**Output format**: newline-separated absolute file paths
 
 ## Platform-Specific Notes
 
 ### fff Binary Download
 
-The `@ff-labs/fff-node` package downloads platform-specific binaries automatically via npm optional dependencies. If this fails, users may need to manually install:
+The `@ff-labs/fff-node` package downloads platform-specific binaries automatically via npm optional dependencies:
 
 - Linux x64: `@ff-labs/fff-bin-linux-x64-gnu` (or `-musl` for Alpine)
 - macOS Intel: `@ff-labs/fff-bin-darwin-x64`
@@ -356,7 +442,6 @@ The `@ff-labs/fff-node` package downloads platform-specific binaries automatical
 - Global: `~/.config/opencode/plugins/` (Linux/macOS) or `%APPDATA%\opencode\plugins\` (Windows)
 - Project-local: `.opencode/plugins/` (any OS)
 
-
 ## Testing
 
 Automated test suite using `node:test` (zero external dependencies, Node.js 18+).
@@ -367,27 +452,10 @@ Automated test suite using `node:test` (zero external dependencies, Node.js 18+)
 node --test test/index.test.js
 ```
 
-78 unit tests across 23 suites covering initialization, tool shape, grep/glob behavior,
-case sensitivity, path filtering, exclude patterns, limits, abort handling, regex, and
-edge cases.
-
-| Suite | Tests | What's verified |
-|-------|-------|-----------------|
-| Initialization | 7 | Plugin export shape, PluginInput compat, bad directory error, instance caching, logging, broken log survival |
-| Tool definition shape | 6 | OpenCode SDK contract, parameter names match built-in grep/glob, return type is `string` |
-| grep basic | 7 | Pattern matching, `file:line:content` format, relative paths, empty results, input validation |
-| grep case sensitivity | 5 | Smart case default, uppercase auto-enables case-sensitive, `caseSensitive=true/false` |
-| grep path filtering | 5 | Subdirectory scope, trailing slash normalization, nested paths |
-| grep exclude | 4 | Single glob, comma-separated, whitespace trimming, hidden files |
-| grep context | 2 | Context lines before/after match |
-| grep limit | 6 | Limit enforcement, edge cases (0, negative, >5000) |
-| grep input validation | 3 | Negative context, non-number types |
-| grep abort | 1 | Pre-aborted signal |
-| grep regex | 2 | Valid regex, invalid regex graceful fallback |
-| glob basic | 6 | Fuzzy file search, newline paths, empty results, input validation |
-| glob type filter | 3 | Default (file), type=directory, invalid type coercion |
-| glob path/limit/abort | 4 | Path filtering, trailing slash, limit, abort |
-| Edge cases | 8 | Special regex chars, long pattern, combined params, extra args, concurrent calls |
+85 unit tests across 24 suites covering initialization, tool shape, grep/glob behavior,
+path filtering, exclude filtering, context lines, limit, file-specific search,
+case sensitivity (smart case + explicit), regex mode, abort handling, pagination,
+stress tests, and edge cases.
 
 ### Session simulation tests (synthetic 270-file project)
 
@@ -395,14 +463,7 @@ edge cases.
 node --test test/session-*.js
 ```
 
-7 tests simulating real OpenCode agent behavior on a synthetic project:
-- Interleaved edits + searches (200 cycles)
-- File renames during in-flight searches (50 searches + 25 renames)
-- Session DB truncate+rewrite (200 cycles)
-- Git index rewrite (100 cycles)
-- npm install/uninstall (50 creates + 25 removes)
-- Full 500-cycle agent session (grep + glob + edits + creates + deletes + renames + DB writes)
-- 5 concurrent finders + 50 concurrent mutations
+7 tests simulating real OpenCode agent behavior on a synthetic project.
 
 ### Integration tests (requires `opencode` CLI)
 
@@ -410,45 +471,15 @@ node --test test/session-*.js
 node --test test/integration-*.js
 ```
 
-4 tests spawning actual `opencode run` processes:
-- Async I/O mutations on synthetic project (200 mutations)
-- Worker-thread mutations on synthetic project (500 mutations)
-- Async I/O mutations on real nodejs/node repo (1000 mutations)
-- Worker-thread mutations on real nodejs/node repo (2000 mutations)
+Spawns actual `opencode run` processes with file mutations. Requires a configured provider.
 
-### Multi-session test
+### Watch-enabled tests
 
 ```bash
-NUM_SESSIONS=6 node --test test/integration-multi-session.js
+node --test test/stress-watch-enabled.js
+node --test test/stress-watch-timing.js
+node --test test/stress-watch-real-repo.js
 ```
-
-Spawns 4-6 concurrent `opencode run` instances with different prompts while
-3000 files are mutated simultaneously. Configurable via `NUM_SESSIONS` env var.
-
-### Watch-enabled tests (mmap OFF, watch ON)
-
-```bash
-node --test test/stress-watch-enabled.js       # Stability tests (~40s)
-node --test test/stress-watch-timing.js         # Debounce timing (~12s)
-node --test test/stress-watch-real-repo.js    # Real repo (48K files, ~55s)
-```
-
-Verifies the file watcher works correctly with mmap disabled:
-- New files appear in search within ~1s on real repos
-- Deleted files are removed from results within ~1s
-- No SIGBUS, no hangs at moderate mutation rates
-- Search latency unchanged (6ms avg grep on 48K files)
-
-### Multi-session watch test
-
-```bash
-NUM_SESSIONS=6 node --test test/integration-multi-session-watch.js
-```
-
-Concurrent opencode sessions + watch-enabled FileFinder + 3000 mutations on real repo.
-Tests watcher stability under real multi-process contention. Results: 0 SIGBUS across
-4-6 sessions with 98% watcher detection rate at 4 sessions, 50% at 6 sessions.
-
 
 ### Mmap cache tests (proves the crash)
 
@@ -457,53 +488,40 @@ node --test test/stress-mmap-enabled.js   # WARNING: will SIGBUS
 node --test test/stress-mmap-single.js    # WARNING: will SIGBUS on real repo
 ```
 
-These tests intentionally enable `disableMmapCache: false` to demonstrate the
-SIGBUS crash. They will kill the test process. See [SIGBUS_INVESTIGATION.md](./SIGBUS_INVESTIGATION.md).
-
-### Real repo tests
-
-Integration tests that use the nodejs/node repository require:
-
-```bash
-git clone --depth=1 https://github.com/nodejs/node.git /tmp/stress-test-repos/nodejs
-```
-
-Some tests also accept `NODEJS_REPO` env var to point to a different repo.
+See [SIGBUS_INVESTIGATION.md](./SIGBUS_INVESTIGATION.md).
 
 ## Common Gotchas
 
-1. **Return format**: Must return strings, not objects. This is critical for OpenCode tool integration.
-
-2. **Scan timeout**: The 5s timeout in tool execute is intentional. Don't increase it—users want results even if scan isn't complete.
-
-3. **Path trailing slashes**: Always use `.replace(/\/+$/, "")` before filtering to handle both "src" and "src/" inputs.
-
-4. **Limit validation**: Validate with `args.limit != null &&` (not `args.limit &&`) to catch `limit: 0`. Then apply with `Math.max(1, args.limit || default)`.
-
+1. **Return format**: Must return `{ output, metadata }` objects, not plain strings. TUI reads metadata for match counts.
+2. **Scan timeout**: The 5s timeout in tool execute is intentional. Don't increase it.
+3. **exclude filtering**: Match against both `fileName` and `relativePath` — `minimatch("dir/Foo.vue", "*.vue")` returns false.
+4. **Configurable limits**: Default 100 results for both tools, configurable up to 5000 via `limit` param.
 5. **Abort checking**: Check `context.abort.aborted` both at start AND after any async operation.
-
-6. **Logging overhead**: Excessive debug logs can slow down the plugin. Only log errors, warnings, and key lifecycle events.
-
-7. **minimatch import**: Must use named import: `import { minimatch } from "minimatch"` (not default import).
-
-8. **peerDependency**: `@opencode-ai/plugin` is a peer dependency—users install it, not the plugin itself.
-
-9. **aiMode setting**: `FileFinder.create({ basePath: directory, aiMode: false })` disables the LMDB frecency database (another mmap source). v0.3.3+ uses `false`.
-
-10. **Result indexing**: `result.value.items` contains matches/items, not the result object itself. Always check `result.ok` first.
-11. **disableMmapCache**: Always use `disableMmapCache: true`. mmap maps files into memory; any truncation/delete causes SIGBUS. Standard read() is used instead.
-
-12. **disableWatch**: Set to `true` (watcher disabled) due to upstream stack overflow bug in fff-node v0.6.4 ([fff.nvim#422](https://github.com/dmtrKovalenko/fff.nvim/issues/422)).
+6. **minimatch import**: Must use named import: `import { minimatch } from "minimatch"`.
+7. **peerDependency**: `@opencode-ai/plugin` is a peer dependency — users install it, not the plugin itself.
+8. **Smart case**: Uppercase/mixed-case patterns search case-sensitively. Use lowercase for broad matching. Override with `caseSensitive` param.
+9. **Recall gap**: fff's grep may miss matches in directories. Single-file searches have 100% recall. For directory-wide 100% recall, fall back to bash `grep`.
+10. **Single-file search**: When `path` points to a file, the plugin reads it directly with Node.js — bypasses fff entirely.
+11. **Glob detection**: `GLOB_METACHAR_RE = /[*?\[]/` — patterns with `*`, `?`, or `[` use minimatch post-filter. Others use fff's fuzzy finder.
+12. **type=directory**: Glob tool supports `type="directory"` for both glob patterns and fuzzy queries. Metachar patterns with `type=directory` skip fff and use `globWalk` directly (fff's `directorySearch` is fuzzy, not glob-aware). Directory matching checks both `relativePath` and `entry.name` so `*` matches nested directories.
+13. **globWalk fallback**: Triggers for ALL empty-result cases (not just metachar patterns). For non-metachar patterns, also augments fff's fuzzy results when no exact basename match exists (e.g., `temp.ts` pattern where fff returns 100 fuzzy `.ts` files but none is `temp.ts`). Handles `type="directory"`, Unicode filenames, and fff index gaps.
+14. **Item normalization**: fff `directorySearch` may return items with `path` instead of `relativePath`. The plugin normalizes all items to prevent `undefined.split()` crashes.
+15. **fsGrep for non-ASCII**: Patterns with Turkish/Unicode characters (`ş`, `ı`, `İ`) route via `/[^\x00-\x7F]/` to `fsGrep`, which reads files with Node.js `readFileSync` and exact Unicode regex (`giu`). This avoids fff's `ş↔s` normalization overcount. The `fsGrep` path applies include/exclude during the walk — no double filtering.
+16. **loadGitignoreFilter**: `fsGrep` and `globWalk` parse `.gitignore` to augment `SKIP_DIRS` with directory-name entries. Cached per basePath. Dot-prefixed dirs are always skipped. fff's own index also respects `.gitignore` natively via the Rust `ignore` crate.
+17. **Pagination**: `fetchGrepPages` uses dynamic `maxPages = ceil(limit/50) + 2` instead of fixed `MAX_GREP_PAGES`. fff's `pageLimit` is hardcoded to 50 in `finder.ts` and not exposed via `GrepOptions`.
+18. **Context rendering**: When `context > 0`, the output loop renders `contextBefore` lines (with correct line numbers before the match), the match line itself, then `contextAfter` lines. Both fff grep items and `directFileGrep`/`fsGrep` items carry `contextBefore`/`contextAfter` arrays.
 
 ## Dependencies
 
 ### Runtime
-- `@ff-labs/fff-node` ^0.6.4 - Core search engine (Rust wrapper)
-- `minimatch` ^10.2.5 - Glob pattern matching for `exclude` parameter
+- `@ff-labs/fff-node` ^0.7.0 - Core search engine (Rust wrapper)
+- `minimatch` ^10.2.5 - Glob pattern matching for exclude parameter and `globWalk`
 
 ### Peer Dependencies
-``
-opencode-fff-search-plugin/
+- `@opencode-ai/plugin` ^1.14.28 - OpenCode plugin SDK
+
+```
+opencode-fff-search/
 ├── index.js          # Single plugin file (ES module)
 ├── package.json      # NPM package configuration
 ├── test/
@@ -522,12 +540,12 @@ opencode-fff-search-plugin/
 │   ├── integration-real-repo.js       # Live opencode + real repo mutations
 │   ├── integration-worker-real.js     # Live opencode + worker + real repo
 │   ├── integration-multi-session.js   # Concurrent opencode instances
-│   ├── integration-multi-session-watch.js # Concurrent sessions + watch ON + mutations
+│   ├── integration-multi-session-watch.js # Concurrent sessions + watch ON
 │   ├── stress-mmap-enabled.js         # mmap crash demo (will SIGBUS)
 │   ├── stress-mmap-single.js          # Single-instance mmap crash demo
 │   ├── stress-watch-enabled.js         # Watch ON + mmap OFF stability tests
-│   ├── stress-watch-real-repo.js        # Watch ON + mmap OFF on real repo (48K files)
-│   ├── stress-watch-timing.js           # Watcher debounce timing measurement
+│   ├── stress-watch-real-repo.js        # Watch ON + mmap OFF on real repo
+│   ├── stress-watch-timing.js           # Watcher debounce timing
 │   ├── diagnose-mmap.js               # Isolated mmap diagnostic
 │   ├── mutation-worker.cjs            # CJS worker for synthetic mutations
 │   └── mutation-worker-real.cjs       # CJS worker for real repo mutations
@@ -548,19 +566,17 @@ When modifying the plugin:
 2. **Run session tests**: `node --test test/session-*.js`
 3. **Test locally**: Link the plugin to your OpenCode config and test with real searches
 4. **Check logs**: `opencode debug config --print-logs 2>&1 | grep fff`
-5. **Verify return format**: Ensure tools return strings, not objects
-6. **Update README**: If changing tool parameters or behavior
-7. **Bump version**: Follow semver in `package.json` (major/minor/patch)
-8. **Create git tag**: `git tag vX.Y.Z` before publishing
-9. **Publish to npm**: `npm publish --access public`
+5. **Verify return format**: Ensure tools return `{ output, metadata }`, not plain strings
+6. **Match upstream**: Keep tool contracts aligned with [upstream source](https://github.com/anomalyco/opencode/blob/main/packages/opencode/src/tool/)
+7. **Bump version**: Follow semver in `package.json`
+8. **Publish to npm**: `npm publish --access public`
 
 ## Performance Characteristics
 
 - **First search**: 500ms-2s (index building)
 - **Subsequent searches**: <10ms (in-memory index)
 - **Scan timeout**: 15s absolute limit for `waitForScan`, 5s practical limit in tools
-- **Result limits**: Grep defaults to 1000 matches, glob defaults to 100 results
-- **mmap cache**: Disabled (`disableMmapCache: true`) for stability — prevents SIGBUS on file truncation
-- **File watcher**: Disabled (`disableWatch: true`) due to upstream stack overflow bug (fff.nvim#422)
-
-The shared `scanPromise` pattern is critical—without it, concurrent tool calls would trigger multiple scans, causing severe performance degradation.
+- **Default limits**: 100 matches (grep), 100 results (glob) — configurable up to 5000
+- **mmap cache**: Enabled by default — faster searches via memory-mapped file cache
+- **File watcher**: Enabled by default — detects new/deleted files mid-session
+- **Recall**: ~90%+ for common tokens; inconsistent for edge cases. Single-file searches have 100% recall. Non-ASCII patterns and fff-zero fallback provide exact filesystem-level recall.
