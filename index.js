@@ -507,7 +507,9 @@ export default async (input) => {
                 // Failsafe: if fff returned nothing (or results were all filtered out),
                 // try filesystem-level grep as a fallback (handles fff tokenization gaps)
                 if (matches.length === 0) {
-                  const fallbackDir = join(directory, args.path || "");
+                  const fallbackDir = isAbsolute(args.path || "")
+                    ? args.path
+                    : join(directory, args.path || "");
                   matches = fsGrep(fallbackDir, directory, args.pattern, ctxLines, null, args.include, args.exclude);
                 }
               }
